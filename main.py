@@ -293,6 +293,194 @@ async def process_excel(file: UploadFile = File(..., description="Excel file to 
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
+
+
+
+class FileUploadBase64(BaseModel):
+    file: str  # base64 encoded file content
+    filename: str  # original filename
+
+
+
+
+# Add NEW endpoint for base64 input from Power Automate
+@app.post("/process-base64", response_model=LRNumbersResponse)
+async def process_excel_base64(data: FileUploadBase64):
+    """
+    Process Excel file from base64 encoded content (for Power Automate)
+    
+    Args:
+        data: JSON with base64 encoded file and filename
+        
+    Returns:
+        Processing results with download link to updated Excel file
+    """
+    # Validate file type
+    if not data.filename.endswith(('.xlsx', '.xls')):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload an Excel file (.xlsx or .xls)"
+        )
+    
+    try:
+        # Decode base64 to bytes
+        try:
+            file_content = base64.b64decode(data.file)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid base64 encoding: {str(e)}"
+            )
+        
+        # Save uploaded file temporarily
+        temp_dir = Path("temp_uploads")
+        temp_dir.mkdir(exist_ok=True)
+        temp_file_path = temp_dir / data.filename
+        
+        with open(temp_file_path, "wb") as buffer:
+            buffer.write(file_content)
+        
+        logger.info(f"File uploaded: {data.filename}")
+        
+        # Read Excel file, enforcing string for LrNumber to avoid scientific notation
+        df = pd.read_excel(temp_file_path, dtype={'LrNumber': str})
+        logger.info(f"Loaded {len(df)} rows")
+
+        # Finding missing delivery formats
+        missing_delivery_mask = df['Delivery Format'].isna()
+        all_lr_numbers = df.loc[missing_delivery_mask, 'LrNumber'].astype(str).tolist()
+        
+        # Validate LR numbers by length
+        valid_lr_numbers = [lr for lr in all_lr_numbers if len(lr) == LR_NUMBER_LENGTH]
+        invalid_lr_numbers = [lr for lr in all_lr_numbers if len(lr) != LR_NUMBER_LENGTH]
+        
+        logger.info(f"Total LR numbers: {len(all_lr_numbers)}, Valid: {len(valid_lr_numbers)}, Invalid: {len(invalid_lr_numbers)}")
+        
+        # Track statuses for valid LR numbers in parallel
+        if valid_lr_numbers:
+            logger.info(f"Fetching statuses for {len(valid_lr_numbers)} LR numbers...")
+            tracking_results = await track_multiple_lr_numbers(
+                valid_lr_numbers,
+                max_concurrent=MAX_CONCURRENT_REQUESTS
+            )
+            
+            # Update Excel file with statuses
+            statuses_updated = 0
+            for lr_number, result in tracking_results.items():
+                status = result.get('status', 'ERROR')
+                
+                # Find rows with this LR number and update Current Status
+                lr_mask = (df['LrNumber'].astype(str) == lr_number) & missing_delivery_mask
+                if lr_mask.any():
+                    df.loc[lr_mask, 'Current Status'] = status
+                    # Convert Delivery Format to string to avoid dtype warning
+                    df['Delivery Format'] = df['Delivery Format'].astype(str)
+                    df.loc[lr_mask, 'Delivery Format'] = 'done'
+                    statuses_updated += 1
+                    logger.info(f"Updated LR {lr_number}: {status}")
+            
+            # Save updated Excel file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_filename = f"{Path(data.filename).stem}_updated_{timestamp}.xlsx"
+            output_path = OUTPUT_DIR / output_filename
+            
+            df.to_excel(output_path, index=False)
+            logger.info(f"Saved updated file to: {output_path}")
+        else:
+            statuses_updated = 0
+            output_path = None
+        
+        # Process batches info
+        processing_info = await process_lr_batch(
+            valid_lr_numbers, 
+            batch_size=BATCH_SIZE
+        )
+        processing_info['max_concurrent'] = MAX_CONCURRENT_REQUESTS
+        processing_info['valid_lr_count'] = len(valid_lr_numbers)
+        processing_info['invalid_lr_count'] = len(invalid_lr_numbers)
+        processing_info['lr_number_length_required'] = LR_NUMBER_LENGTH
+        processing_info['statuses_fetched'] = len(tracking_results) if valid_lr_numbers else 0
+        
+        # Clean up temp file
+        try:
+            temp_file_path.unlink()
+        except:
+            pass    
+        
+        return LRNumbersResponse(
+            total_records=len(df),
+            na_count=len(all_lr_numbers),
+            valid_lr_numbers=valid_lr_numbers,
+            invalid_lr_numbers=invalid_lr_numbers,
+            first_valid_lr_number=valid_lr_numbers[0] if valid_lr_numbers else None,
+            processing_info=processing_info,
+            statuses_updated=statuses_updated,
+            output_file=str(output_path) if output_path else None
+        )
+        
+    except Exception as e:
+        logger.error(f"Error processing file: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+
+
+# NEW ENDPOINT: Base64 version for Power Automate
+@app.post("/analyze-delays-base64", response_model=DelayAnalysisResponse, response_model_exclude_none=False)
+async def analyze_delay_file_base64(data: FileUploadBase64):
+    """
+    Upload an Excel file (as base64) to analyze shipment delays.
+    For Power Automate integration.
+    
+    Expected columns:
+    - Current Status (or Status)
+    - Delay by [unit] (any column containing "delay by")
+    
+    Returns:
+    - JSON structure with delay analysis categorized by status and delay duration
+    """
+    try:
+        # Decode base64 to bytes
+        try:
+            file_content = base64.b64decode(data.file)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid base64 encoding: {str(e)}"
+            )
+        
+        # Determine file type and read accordingly
+        if data.filename.endswith('.xlsx') or data.filename.endswith('.xls'):
+            df = pd.read_excel(io.BytesIO(file_content))
+        elif data.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(file_content))
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported file format. Please upload .xlsx, .xls, or .csv file"
+            )
+        
+        # Analyze delays using the logic from delay_analyzer.py
+        result = analyze_delays(df)
+        
+        html_table = build_html_table(result)
+        result["html_table"] = html_table
+
+        # write the table HTML into file to test
+        with open("testAnalyzedTable.html", "w", encoding="utf-8") as f:
+            f.write(result["html_table"])
+
+        print(f"Result Returned from delay analyzation API (base64): {result}")
+        return result
+    
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+    
+
+
+
+    
 def build_html_table(response_json: dict) -> str:
     headers = response_json["headers"]
     rows = response_json["data"]
@@ -452,138 +640,6 @@ async def analyze_delay_file(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
-
-
-
-class FileUploadBase64(BaseModel):
-    file: str  # base64 encoded file content
-    filename: str  # original filename
-
-
-
-
-# Add NEW endpoint for base64 input from Power Automate
-@app.post("/process-base64", response_model=LRNumbersResponse)
-async def process_excel_base64(data: FileUploadBase64):
-    """
-    Process Excel file from base64 encoded content (for Power Automate)
-    
-    Args:
-        data: JSON with base64 encoded file and filename
-        
-    Returns:
-        Processing results with download link to updated Excel file
-    """
-    # Validate file type
-    if not data.filename.endswith(('.xlsx', '.xls')):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid file type. Please upload an Excel file (.xlsx or .xls)"
-        )
-    
-    try:
-        # Decode base64 to bytes
-        try:
-            file_content = base64.b64decode(data.file)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid base64 encoding: {str(e)}"
-            )
-        
-        # Save uploaded file temporarily
-        temp_dir = Path("temp_uploads")
-        temp_dir.mkdir(exist_ok=True)
-        temp_file_path = temp_dir / data.filename
-        
-        with open(temp_file_path, "wb") as buffer:
-            buffer.write(file_content)
-        
-        logger.info(f"File uploaded: {data.filename}")
-        
-        # Read Excel file, enforcing string for LrNumber to avoid scientific notation
-        df = pd.read_excel(temp_file_path, dtype={'LrNumber': str})
-        logger.info(f"Loaded {len(df)} rows")
-
-        # Finding missing delivery formats
-        missing_delivery_mask = df['Delivery Format'].isna()
-        all_lr_numbers = df.loc[missing_delivery_mask, 'LrNumber'].astype(str).tolist()
-        
-        # Validate LR numbers by length
-        valid_lr_numbers = [lr for lr in all_lr_numbers if len(lr) == LR_NUMBER_LENGTH]
-        invalid_lr_numbers = [lr for lr in all_lr_numbers if len(lr) != LR_NUMBER_LENGTH]
-        
-        logger.info(f"Total LR numbers: {len(all_lr_numbers)}, Valid: {len(valid_lr_numbers)}, Invalid: {len(invalid_lr_numbers)}")
-        
-        # Track statuses for valid LR numbers in parallel
-        if valid_lr_numbers:
-            logger.info(f"Fetching statuses for {len(valid_lr_numbers)} LR numbers...")
-            tracking_results = await track_multiple_lr_numbers(
-                valid_lr_numbers,
-                max_concurrent=MAX_CONCURRENT_REQUESTS
-            )
-            
-            # Update Excel file with statuses
-            statuses_updated = 0
-            for lr_number, result in tracking_results.items():
-                status = result.get('status', 'ERROR')
-                
-                # Find rows with this LR number and update Current Status
-                lr_mask = (df['LrNumber'].astype(str) == lr_number) & missing_delivery_mask
-                if lr_mask.any():
-                    df.loc[lr_mask, 'Current Status'] = status
-                    # Convert Delivery Format to string to avoid dtype warning
-                    df['Delivery Format'] = df['Delivery Format'].astype(str)
-                    df.loc[lr_mask, 'Delivery Format'] = 'done'
-                    statuses_updated += 1
-                    logger.info(f"Updated LR {lr_number}: {status}")
-            
-            # Save updated Excel file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_filename = f"{Path(data.filename).stem}_updated_{timestamp}.xlsx"
-            output_path = OUTPUT_DIR / output_filename
-            
-            df.to_excel(output_path, index=False)
-            logger.info(f"Saved updated file to: {output_path}")
-        else:
-            statuses_updated = 0
-            output_path = None
-        
-        # Process batches info
-        processing_info = await process_lr_batch(
-            valid_lr_numbers, 
-            batch_size=BATCH_SIZE
-        )
-        processing_info['max_concurrent'] = MAX_CONCURRENT_REQUESTS
-        processing_info['valid_lr_count'] = len(valid_lr_numbers)
-        processing_info['invalid_lr_count'] = len(invalid_lr_numbers)
-        processing_info['lr_number_length_required'] = LR_NUMBER_LENGTH
-        processing_info['statuses_fetched'] = len(tracking_results) if valid_lr_numbers else 0
-        
-        # Clean up temp file
-        try:
-            temp_file_path.unlink()
-        except:
-            pass    
-        
-        return LRNumbersResponse(
-            total_records=len(df),
-            na_count=len(all_lr_numbers),
-            valid_lr_numbers=valid_lr_numbers,
-            invalid_lr_numbers=invalid_lr_numbers,
-            first_valid_lr_number=valid_lr_numbers[0] if valid_lr_numbers else None,
-            processing_info=processing_info,
-            statuses_updated=statuses_updated,
-            output_file=str(output_path) if output_path else None
-        )
-        
-    except Exception as e:
-        logger.error(f"Error processing file: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
-
-
-
-
 @app.post("/analyze-delays-by-lsp", response_model=LSPDelayAnalysisResponse, response_model_exclude_none=False)
 async def analyze_delay_by_lsp_file(file: UploadFile = File(...)):
     """
@@ -631,7 +687,57 @@ async def analyze_delay_by_lsp_file(file: UploadFile = File(...)):
 
 
 
+@app.post("/analyze-delays-by-lsp-base64", response_model=LSPDelayAnalysisResponse, response_model_exclude_none=False)
+async def analyze_delay_by_lsp_file_base64(data: FileUploadBase64):
+    """
+    Upload an Excel file (as base64) to analyze shipment delays grouped by LSP company.
+    For Power Automate integration.
+    
+    Expected columns:
+    - LSPName (logistics service provider company name)
+    - Delay by [unit] (any column containing "delay by")
+    
+    Returns:
+    - JSON structure with delay analysis categorized by LSP company and delay duration
+    """
+    try:
+        # Decode base64 to bytes
+        try:
+            file_content = base64.b64decode(data.file)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid base64 encoding: {str(e)}"
+            )
+        
+        # Determine file type and read accordingly
+        if data.filename.endswith('.xlsx') or data.filename.endswith('.xls'):
+            df = pd.read_excel(io.BytesIO(file_content))
+        elif data.filename.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(file_content))
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported file format. Please upload .xlsx, .xls, or .csv file"
+            )
+        
+        # Analyze delays by LSP using the logic from delay_analyzer.py
+        result = analyze_delays_by_lsp(df)
+        
+        html_table = build_lsp_html_table(result)
+        result["html_table"] = html_table
 
+        # write the table HTML into file to test
+        with open("testLSPTable.html", "w", encoding="utf-8") as f:
+            f.write(result["html_table"])
+
+        print(f"Result Returned from LSP delay analyzation API (base64): {result}")
+        return result
+    
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
 
@@ -652,4 +758,3 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
-

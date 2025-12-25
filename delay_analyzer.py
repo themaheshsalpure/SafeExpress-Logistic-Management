@@ -20,6 +20,21 @@ class DelayData(BaseModel):
     grand_total: int
 
 
+# class DelayAnalysisResponse(BaseModel):
+#     """Model for the complete delay analysis response"""
+#     model_config = ConfigDict(
+#         # Ensure None/null values are included in JSON output
+#         use_enum_values=True,
+#         validate_assignment=True
+#     )
+    
+#     headers: List[str]
+#     data: List[DelayData]
+#     totals: DelayData
+
+
+from typing import Optional
+
 class DelayAnalysisResponse(BaseModel):
     """Model for the complete delay analysis response"""
     model_config = ConfigDict(
@@ -31,6 +46,7 @@ class DelayAnalysisResponse(BaseModel):
     headers: List[str]
     data: List[DelayData]
     totals: DelayData
+    html_table: Optional[str] = None  # Optional with default None
 
 
 # Predefined list of statuses to always include in the response
@@ -73,10 +89,22 @@ class LSPDelayData(BaseModel):
     grand_total: int
 
 
+# class LSPDelayAnalysisResponse(BaseModel):
+#     """Model for the complete LSP delay analysis response"""
+#     model_config = ConfigDict(
+#         # Ensure None/null values are included in JSON output
+#         use_enum_values=True,
+#         validate_assignment=True
+#     )
+    
+#     headers: List[str]
+#     data: List[LSPDelayData]
+#     totals: LSPDelayData
+
+
 class LSPDelayAnalysisResponse(BaseModel):
-    """Model for the complete LSP delay analysis response"""
+    """Model for the LSP delay analysis response"""
     model_config = ConfigDict(
-        # Ensure None/null values are included in JSON output
         use_enum_values=True,
         validate_assignment=True
     )
@@ -84,6 +112,7 @@ class LSPDelayAnalysisResponse(BaseModel):
     headers: List[str]
     data: List[LSPDelayData]
     totals: LSPDelayData
+    html_table: Optional[str] = None  # Optional with default None
 
 
 def categorize_delay(delay_value):
